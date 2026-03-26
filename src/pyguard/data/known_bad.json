@@ -1,0 +1,7 @@
+{
+  "litellm": {
+    "versions": ["1.82.7", "1.82.8"],
+    "reason": "Supply chain attack via compromised CI/CD pipeline (2025-03-24). Malicious .pth file exfiltrates secrets on Python startup.",
+    "reference": "https://github.com/BerriAI/litellm/issues/9656"
+  }
+}

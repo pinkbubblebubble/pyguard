@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyguard"
+version = "0.1.0"
+description = "Scan your Python environment for poisoned packages"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+pyguard = "pyguard.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyguard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
