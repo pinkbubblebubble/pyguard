@@ -1,125 +1,136 @@
-# pyguard
+<div align="center">
+  <img src="assets/logo.svg" width="100" alt="pyguard logo"/>
+  <h1>pyguard</h1>
+  <p><strong>Scan your Python environment for poisoned packages.</strong></p>
 
-Scan your Python environment for poisoned packages.
+  <p>
+    <a href="https://github.com/pinkbubblebubble/pyguard/actions"><img src="https://github.com/pinkbubblebubble/pyguard/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
+    <img src="https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue" alt="Python versions"/>
+    <img src="https://img.shields.io/badge/license-MIT-green" alt="License"/>
+  </p>
 
-pyguard combines two things most tools do separately: **CVE detection** and **supply-chain poisoning detection**.
-
-CVE scanners miss poisoned releases with no filed vulnerability. Static analyzers miss the `.pth` backdoor that runs before your code starts. pyguard does both.
+  <p>
+    <a href="README.md">English</a> · <a href="README.zh.md">中文</a>
+  </p>
+</div>
 
 ---
 
-## Why this exists
+On March 24, 2025, litellm versions 1.82.7 and 1.82.8 were quietly poisoned. The malicious release added a `.pth` file that ran automatically on every Python startup — silently reading API keys, SSH credentials, and cloud tokens, then sending them to an external server.
 
-In March 2025, litellm versions 1.82.7 and 1.82.8 were poisoned via a compromised CI/CD pipeline. The malicious versions added a `.pth` file that executed automatically on every Python startup — reading API keys, SSH credentials, and cloud tokens, then exfiltrating them to an external server.
+No CVE was filed. pip-audit saw nothing. The package came from the real PyPI project.
 
-No CVE was filed. No existing scanner caught it. `pip install litellm` gave you the real package from the real PyPI project.
+**pyguard is built to catch exactly this.**
 
-pyguard is built to catch exactly this class of attack.
+---
+
+## What it checks
+
+| Check | What it catches |
+|---|---|
+| **CVE lookup** | Known vulnerabilities via the [OSV database](https://osv.dev) |
+| **Known bad versions** | Confirmed malicious releases (e.g. litellm 1.82.7 / 1.82.8) |
+| **`.pth` startup backdoors** | Code that executes automatically before your program starts |
+| **`sitecustomize` injection** | `sitecustomize.py` / `usercustomize.py` in site-packages |
+| **Secret + network combo** | Files that read credentials *and* make outbound calls |
+| **Secret access** | References to env vars, `~/.ssh`, `~/.aws`, kubeconfig, API key names |
 
 ---
 
 ## Install
 
 ```bash
-pip install pyguard
-```
-
-## Usage
-
-```bash
-pyguard scan                  # scan all packages in current environment
-pyguard scan litellm          # scan one specific package
-```
-
-## Example output
-
-```
-Scanning: /Users/you/.venv/lib/python3.11/site-packages
-
-[HIGH]   litellm 1.82.8
-         • known malicious version (supply chain incident 2025-03-24)
-         • startup .pth file detected: litellm_init.pth
-         • .pth contains executable import statement
-         • reads os.environ + makes outbound HTTP calls
-
-[MEDIUM] requests-wrapper 0.3.1
-         • references ~/.aws and ~/.ssh paths
-         • contains outbound network calls
-
-23 packages scanned — 1 HIGH, 1 MEDIUM, 21 clean
+pip install git+https://github.com/pinkbubblebubble/pyguard.git
 ```
 
 ---
 
-## How it works
+## Usage
 
-pyguard runs four layers of checks against your installed packages:
+```bash
+# Scan your entire environment
+pyguard scan
 
-**1. CVE lookup**
-Queries the [OSV vulnerability database](https://osv.dev) for known CVEs and security advisories for every installed package and version.
+# Scan a specific package
+pyguard scan litellm
 
-**2. Startup execution check**
-Detects `.pth` files, `sitecustomize.py`, and `usercustomize.py` that execute code automatically when Python starts — before your program runs a single line.
+# Skip CVE network lookup (faster, offline)
+pyguard scan --no-cve
 
-**3. Known bad versions**
-Matches installed packages against a maintained denylist of confirmed malicious releases (e.g. litellm 1.82.7 / 1.82.8).
+# Show full details for every finding
+pyguard scan --verbose
+```
 
-**4. Static behavior analysis**
-Scans package source for high-risk signal combinations: files that both access secrets (env vars, `~/.ssh`, `~/.aws`, cloud credentials) and make outbound network calls.
+### Example output
+
+```
+Scanning: /Users/you/.venv/bin/python
+
+[HIGH]  litellm 1.82.8
+         • known malicious version (supply chain incident 2025-03-24)
+           Supply chain attack via compromised CI/CD pipeline. Malicious .pth
+           file exfiltrates secrets on Python startup.
+         • startup .pth file with executable code: litellm_init.pth
+           This file runs automatically when Python starts.
+
+[HIGH]  requests 2.32.3
+         • known vulnerability: CVE-2024-47081
+           Credentials may be leaked to third-party servers via Authorization headers
+         • secret access + outbound network in requests/sessions.py
+           Same file reads credentials and makes network calls.
+
+[MEDIUM] boto3 1.34.0
+         • references sensitive paths or credential names (2 file(s))
+
+47 packages scanned  2 HIGH  1 MEDIUM  44 clean
+```
 
 ---
 
 ## How pyguard differs from existing tools
 
-Most Python security tools focus on CVEs or static code quality. pyguard focuses on a different threat model: **a legitimate package that has been poisoned at the release level**.
+Most Python security tools look for CVEs. pyguard looks for **poisoned releases** — a legitimate package tampered with at the release level, often with no CVE filed.
 
-| Capability | pip-audit | safety | bandit | semgrep | pyguard |
-|---|---|---|---|---|---|
+| Capability | pip-audit | safety | bandit | semgrep | **pyguard** |
+|---|:---:|:---:|:---:|:---:|:---:|
 | CVE detection | ✅ | ✅ | ❌ | ❌ | ✅ |
 | Static code analysis | ❌ | ❌ | ✅ | ✅ | ✅ |
-| Scans local environment (site-packages) | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Detects `.pth` startup backdoors | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Scans local site-packages | ❌ | ❌ | ❌ | ❌ | ✅ |
+| `.pth` startup backdoor detection | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Supply-chain poisoning detection | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Attributes findings to specific package | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Detects secret access + exfiltration combo | ❌ | ❌ | partial | partial | ✅ |
+| Secret + exfiltration combo detection | ❌ | ❌ | partial | partial | ✅ |
 
-**pip-audit / safety**: excellent for known CVEs, but blind to poisoned releases with no CVE filed — the litellm incident had no CVE.
+**pip-audit / safety** are excellent for CVEs, but blind to poisoned releases with no CVE filed — the litellm incident had no CVE when it happened.
 
-**bandit / semgrep**: great for scanning your own code, not designed to inspect installed third-party packages as a unit and attribute risk back to them.
-
-pyguard combines both: *CVE coverage + runtime supply-chain inspection for Python environments*.
+**bandit / semgrep** are great for scanning *your own* code, not for inspecting installed third-party packages as a unit and attributing risk back to the package.
 
 ---
 
-## Detection rules
+## Use in CI
 
-| Rule | Severity | What it checks |
-|------|----------|----------------|
-| CVE lookup | HIGH / MEDIUM | queries OSV database for known vulnerabilities |
-| Known malicious version | HIGH | matches against confirmed bad release denylist |
-| `.pth` startup execution | HIGH | `.pth` file with executable Python statements |
-| `sitecustomize` injection | HIGH | `sitecustomize.py` / `usercustomize.py` present |
-| Secret + network combo | HIGH | same file reads credentials AND makes outbound calls |
-| Secret access | MEDIUM | references to env vars, `~/.ssh`, `~/.aws`, kubeconfig, known key names |
-| Network calls | LOW | uses `requests`, `httpx`, `urllib`, `socket` |
+Exit code is `1` if any HIGH findings are detected, making it easy to fail a pipeline:
 
----
-
-## Scope
-
-pyguard v1 is intentionally narrow: **local environment, static analysis only**.
-
-Out of scope for v1:
-- Dynamic sandbox execution
-- Network traffic monitoring
-- GitHub Actions workflow scanning
-- CI/CD integration
+```yaml
+- name: Check for poisoned packages
+  run: pyguard scan --no-cve
+```
 
 ---
 
 ## Contributing
 
-PRs to `data/known_bad.json` are especially welcome when new supply-chain incidents are confirmed.
+PRs to [`data/known_bad.json`](src/pyguard/data/known_bad.json) are especially welcome when new supply-chain incidents are confirmed.
+
+```json
+{
+  "package-name": {
+    "versions": ["x.y.z"],
+    "reason": "Brief description of the incident.",
+    "reference": "https://link-to-issue-or-report"
+  }
+}
+```
 
 ---
 

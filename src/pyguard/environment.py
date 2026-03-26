@@ -8,7 +8,7 @@ from __future__ import annotations
 import sys
 import site
 from dataclasses import dataclass, field
-from importlib.metadata import packages_distributions, distributions
+from importlib.metadata import distributions
 from pathlib import Path
 
 

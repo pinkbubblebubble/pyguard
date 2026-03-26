@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <!-- Shield background -->
+  <path d="M60 8 L100 24 L100 64 Q100 92 60 112 Q20 92 20 64 L20 24 Z"
+        fill="#1a1a2e" stroke="#e63946" stroke-width="3"/>
+
+  <!-- Shield inner glow -->
+  <path d="M60 18 L92 31 L92 63 Q92 85 60 102 Q28 85 28 63 L28 31 Z"
+        fill="#16213e" stroke="none"/>
+
+  <!-- Snake body (simplified Python snake) -->
+  <path d="M48 50 Q48 42 56 42 Q64 42 64 50 L64 58 Q64 62 60 62 L56 62 Q52 62 52 66 Q52 70 56 70 L72 70"
+        fill="none" stroke="#e63946" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Snake head -->
+  <circle cx="74" cy="70" r="5" fill="#e63946"/>
+  <!-- Snake eye -->
+  <circle cx="76" cy="68.5" r="1.2" fill="#1a1a2e"/>
+
+  <!-- Second snake (mirrored, accent color) -->
+  <path d="M72 50 Q72 42 64 42"
+        fill="none" stroke="#457b9d" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Lock icon at bottom of shield -->
+  <rect x="53" y="76" width="14" height="10" rx="2" fill="#e63946"/>
+  <path d="M56 76 L56 72 Q56 68 60 68 Q64 68 64 72 L64 76"
+        fill="none" stroke="#e63946" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Label -->
+  <text x="60" y="132" font-family="monospace" font-size="13" font-weight="bold"
+        fill="#e63946" text-anchor="middle" letter-spacing="2">pyguard</text>
+</svg>
